@@ -6,7 +6,7 @@ Reference implementation for the experiments in *"Equivariance and Augmentation 
 - **`proj`** — one-shot projection of the posterior mean and scale onto the C₄-equivariant subspace.
 - **`gcnn`** — block-circulant expansion of a trained small model into a group-convolutional network.
 
-It also contains the empirical verification scripts for the sample-complexity results (the equivariance defect Δ_F^eq and its Monte-Carlo behaviour as a function of the number of posterior samples *T*).
+It also contains the empirical verification scripts for the sample-complexity results (the equivariance defect $Δ_{F}^{eq}$ and its Monte-Carlo behaviour as a function of the number of posterior samples $T$).
 
 ## Repository layout
 
@@ -80,7 +80,7 @@ python scripts/train_theorem3.py --dataset FashionMNIST --train_size 5000 \
 
 ### Monte-Carlo sample complexity (Theorem-4)
 
-Sweeps the equivariance defect over T (powers of two up to `--eval_samples`) and runs a K-fold MC re-evaluation to estimate the per-realisation deviation std, predicted to scale as O(1/√T):
+Sweeps the equivariance defect over T (powers of two up to `--eval_samples`) and runs a K-fold MC re-evaluation to estimate the per-realisation deviation std, predicted to scale as $O(1/\sqrt{T})$:
 
 ```bash
 python scripts/train_theorem4.py --dataset FashionMNIST --train_size 5000 \
