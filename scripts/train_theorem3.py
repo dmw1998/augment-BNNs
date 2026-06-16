@@ -17,7 +17,7 @@ from ebnn.training import evaluate_mc_accuracy, train_baseline_bnn
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Theorem 2 verification: train baseline BNN")
+    parser = argparse.ArgumentParser(description="Theorem 3 verification: train BNN with different priors")
     parser.add_argument(
         "--dataset", type=str, default="FashionMNIST", choices=["MNIST", "FashionMNIST", "CIFAR10"]
     )
@@ -38,7 +38,7 @@ def main():
     parser.add_argument("--train_samples", type=int, default=10)
     parser.add_argument("--eval_samples", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--project", type=str, default="theorem2_verification")
+    parser.add_argument("--project", type=str, default="theorem3_verification")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
     args = parser.parse_args()
