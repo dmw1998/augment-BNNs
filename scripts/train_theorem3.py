@@ -1,7 +1,7 @@
-"""Theorem-2 verification: train a baseline Bayesian CNN and measure the empirical equivariance defect on a held-out C4-orbit evaluation set.
+"""Theorem-3 verification: train a baseline Bayesian CNN and measure the empirical equivariance defect on a held-out C4-orbit evaluation set.
 
 Example:
-    python scripts/train_theorem2.py --dataset FashionMNIST --train_size 5000 --epochs 500 --eval_samples 10 --seed 42
+    python scripts/train_theorem3.py --dataset FashionMNIST --train_size 5000 --epochs 500 --eval_samples 10 --seed 42
 """
 
 import argparse
