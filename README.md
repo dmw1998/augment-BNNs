@@ -2,7 +2,7 @@
 
 Reference implementation for the experiments in *"Equivariance and Augmentation for Bayesian Neural Networks"*. The code studies whether **data augmentation alone** can induce **C₄ (90° rotation) equivariance** in variational Bayesian neural networks, and provides three mechanisms for turning an augmentation-trained posterior into an equivariant one:
 
-- **`avg`** — one-shot C₄ posterior averaging over the orbit (geometric product-of-experts or arithmetic moment matching).
+- **`avg`** — one-shot C₄ posterior averaging over the orbit (geometric averaging or arithmetic moment matching).
 - **`proj`** — one-shot projection of the posterior mean and scale onto the C₄-equivariant subspace.
 - **`gcnn`** — block-circulant expansion of a trained small model into a group-convolutional network.
 
