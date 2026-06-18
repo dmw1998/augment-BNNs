@@ -260,7 +260,12 @@ def run_avg_or_proj(args, loaders, in_channels, device):
     optimizer = _make_optimizer(model, args)
     beta = (1.0 / len(train_loader.dataset)) if args.beta is None else args.beta
 
-    if args.method == "proj":
+    if args.method == "baseline":
+        # No symmetrization: plain augmented training. With symmetrize_fn=None,
+        # every epoch is eligible for the best-accuracy checkpoint.
+        symmetrize_fn = None
+        label = "baseline"
+    elif args.method == "proj":
         symmetrize_fn = apply_one_shot_c4_projection
         label = "proj"
     else:
@@ -338,8 +343,10 @@ def run_gcnn(args, loaders, in_channels, device):
         rho_init=args.rho_init,
         random_prior=args.random_prior,
     ).to(device)
-    expand_small_model_to_gcnn(small_model, gcnn_model, group_size=args.group_size)
-    print(f"Initialized GCNN from small model via C{args.group_size} expansion.")
+    expand_small_model_to_gcnn(
+        small_model, gcnn_model, group_size=args.group_size, arrangement=args.arrangement
+    )
+    print(f"Initialized GCNN from small model via C{args.group_size} expansion ({args.arrangement}).")
 
     opt2 = _make_optimizer(gcnn_model, args)  # fresh buffers => no stale-state issue
     stage2_result = train_phase(
@@ -370,10 +377,12 @@ def run_gcnn(args, loaders, in_channels, device):
 def build_arg_parser():
     p = argparse.ArgumentParser(description="Unified C4-equivariant Bayesian CNN trainer")
 
-    p.add_argument("--method", type=str, default="gcnn", choices=["avg", "proj", "gcnn"])
+    p.add_argument("--method", type=str, default="gcnn", choices=["avg", "proj", "gcnn", "baseline"])
     p.add_argument("--optimizer", type=str, default="sgd", choices=["adamw", "sgd"])
 
-    p.add_argument("--dataset", type=str, default="FashionMNIST", choices=["MNIST", "FashionMNIST", "CIFAR10"])
+    p.add_argument(
+        "--dataset", type=str, default="FashionMNIST", choices=["MNIST", "FashionMNIST", "CIFAR10"]
+    )
     p.add_argument("--train_size", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument(
@@ -438,6 +447,14 @@ def build_arg_parser():
     )
 
     p.add_argument("--group_size", type=int, default=4)
+    p.add_argument(
+        "--arrangement",
+        type=str,
+        default="gcnn",
+        choices=["gcnn", "row_rolled", "row_constant"],
+        help="Orbit-expansion filter tiling (only used when --method gcnn). "
+        "gcnn = main results; row_rolled / row_constant = ablation variants.",
+    )
 
     p.add_argument("--project", type=str, default="training_all_in_one")
     p.add_argument("--run_name", type=str, default=None)
@@ -487,7 +504,7 @@ def main():
         wandb.init(project=args.project, name=args.run_name, config=vars(args))
 
     loaders = (train_loader, test_loader, equiv_loader)
-    if args.method in ("avg", "proj"):
+    if args.method in ("avg", "proj", "baseline"):
         model = run_avg_or_proj(args, loaders, in_channels, device)
     else:
         model = run_gcnn(args, loaders, in_channels, device)

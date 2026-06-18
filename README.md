@@ -19,9 +19,10 @@ ebnn/                     # importable package
 ├── symmetrize.py         # avg / proj / gcnn operators, optimiser + re-init helpers
 └── training.py           # shared ELBO training + MC evaluation loops
 scripts/
-├── train_symmetrization.py  # main trainer: --method {avg, proj, gcnn}
+├── train_symmetrization.py  # main trainer: --method {avg, proj, gcnn, baseline}
 ├── train_theorem3.py        # random prior + invariant prior
-└── train_theorem4.py        # T-sweep + K-fold MC defect (sample complexity)
+├── train_theorem4.py        # T-sweep + K-fold MC defect (sample complexity)
+└── train_multifamily.py     # variational-family comparison (closedness appendix)
 tests/
 └── test_smoke.py            # CPU smoke tests (no dataset / GPU required)
 ```
@@ -85,6 +86,64 @@ Sweeps the equivariance defect over T (powers of two up to `--eval_samples`) and
 ```bash
 python scripts/train_theorem4.py --dataset FashionMNIST --train_size 5000 \
     --epochs 500 --eval_samples 1024 --K_mc_runs 10 --skip_single_sweep
+```
+
+### Closedness of the exponential family (appendix)
+
+The mean-field Gaussian family is closed under the C₄ push-forward, so the
+equivariance results apply; Laplace / Log-Normal are not closed. This experiment
+trains the same architecture with each variational family and compares their
+equivariance metrics:
+
+```bash
+# family in {gaussian, laplace, lognormal}
+python scripts/train_multifamily.py --dataset FashionMNIST --family gaussian \
+    --train_size 5000 --epochs 100 --seed 42
+```
+
+Supports KL annealing (`--kl_annealing_epochs`, `--kl_annealing_epochs_fc`),
+free bits (`--free_bits`), separate conv/fc KL weights, and `--no_augmentation`
+for the no-augmentation baseline.
+
+### Mapping to the paper's tables and figures
+
+All symmetrization runs use the default setup (FashionMNIST, N₀ = 5000, full C₄
+augmentation, `conv_channels [32, 64]`, 500 total epochs, SGD, 5 seeds; vary
+`--seed`). In the symmetrization tables the **Epoch** column is the trigger epoch
+(`--trigger_epoch`, where `0` = right after init) for `avg`/`proj`, and the number
+of Stage-1 epochs (`--stage1_epochs`, with `--stage2_epochs` = 500 − that) for
+`gcnn`.
+
+**Figure 2 — theorem validation** (sweep `--train_size` over {500, 5000, 20000, 50000}):
+
+```bash
+python scripts/train_theorem3.py --train_size 5000                  # (a) invariant prior
+python scripts/train_theorem3.py --train_size 5000 --random_prior   # (a) random prior
+python scripts/train_theorem4.py --train_size 5000 --eval_samples 1024 --K_mc_runs 10 --skip_single_sweep  # (b,c)
+```
+
+**Table 1 — main symmetrization comparison** (SGD; Epoch ∈ {0, 20, 100}):
+
+```bash
+python scripts/train_symmetrization.py --method baseline
+python scripts/train_symmetrization.py --method avg  --avg_method geometric --trigger_epoch 20
+python scripts/train_symmetrization.py --method proj --trigger_epoch 20
+python scripts/train_symmetrization.py --method gcnn --stage1_epochs 100 --stage2_epochs 400  # = bare default
+```
+
+**Table 4 — trigger-timing × optimizer** (Table 1 runs plus `--optimizer adamw`; Epoch ∈ {0, 20, 50, 100, 150}):
+
+```bash
+python scripts/train_symmetrization.py --method proj --optimizer adamw --trigger_epoch 50
+python scripts/train_symmetrization.py --method gcnn --optimizer adamw --stage1_epochs 50 --stage2_epochs 450
+```
+
+**Table 5 — orbit-expansion filter-arrangement ablation** (SGD; `--arrangement`; Epoch ∈ {0, 20, 100}):
+
+```bash
+python scripts/train_symmetrization.py --method gcnn --arrangement gcnn         --stage1_epochs 20 --stage2_epochs 480
+python scripts/train_symmetrization.py --method gcnn --arrangement row_rolled   --stage1_epochs 20 --stage2_epochs 480
+python scripts/train_symmetrization.py --method gcnn --arrangement row_constant --stage1_epochs 20 --stage2_epochs 480
 ```
 
 ## Tests

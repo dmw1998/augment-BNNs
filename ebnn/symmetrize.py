@@ -212,8 +212,39 @@ def apply_one_shot_c4_posterior_average(
 # --------------------------------------------------------------------------- #
 # Method: gcnn -- block-circulant expansion of a trained small model
 # --------------------------------------------------------------------------- #
-def expand_small_model_to_gcnn(small_model: nn.Module, gcnn_model: nn.Module, group_size: int = 4) -> None:
-    """Expand small-model weights to a GCNN using C_|G| rotations (block-circulant)."""
+def _outer_rotation_index(arrangement: str, g_out: int, group_size: int) -> int:
+    """Outer rotation exponent alpha(i) for the orbit-expansion filter arrangements.
+
+    With inner index (g_out - g_in), the net rotation of block (i, j) is
+    R^{alpha(i) + i - j}, matching the appendix ablation:
+
+    * "gcnn"         alpha(i) = +i  -> net R^{2i - j}  (default; used in the paper's main results)
+    * "row_rolled"   alpha(i) =  0  -> net R^{i - j}
+    * "row_constant" alpha(i) = -i  -> net R^{-j}      (all output rows identical)
+    """
+    if arrangement == "gcnn":
+        return g_out % group_size
+    if arrangement == "row_rolled":
+        return 0
+    if arrangement == "row_constant":
+        return (-g_out) % group_size
+    raise ValueError(
+        f"Unknown arrangement: {arrangement!r} (expected 'gcnn', 'row_rolled', or 'row_constant')"
+    )
+
+
+def expand_small_model_to_gcnn(
+    small_model: nn.Module,
+    gcnn_model: nn.Module,
+    group_size: int = 4,
+    arrangement: str = "gcnn",
+) -> None:
+    """Expand small-model weights to a GCNN using C_|G| rotations.
+
+    ``arrangement`` selects the filter-tiling scheme compared in the orbit-expansion
+    ablation (see :func:`_outer_rotation_index`); the default ``"gcnn"`` is the
+    block-circulant scheme used in the main results.
+    """
     angles = [360.0 * g / group_size for g in range(group_size)]
     inv_sqrt_g = 1.0 / math.sqrt(group_size)
 
@@ -244,14 +275,15 @@ def expand_small_model_to_gcnn(small_model: nn.Module, gcnn_model: nn.Module, gr
                 for g_out in range(group_size):
                     row_blocks_mu = []
                     row_blocks_rho = [] if base_weight_rho is not None else None
+                    outer = _outer_rotation_index(arrangement, g_out, group_size)
                     for g_in in range(group_size):
                         k = (g_out - g_in) % group_size
                         rotated_mu = rotate_kernel(base_weight_mu, angle_deg=angles[k])
-                        rotated_mu = rotate_kernel(rotated_mu, angle_deg=angles[g_out])
+                        rotated_mu = rotate_kernel(rotated_mu, angle_deg=angles[outer])
                         row_blocks_mu.append(rotated_mu)
                         if base_weight_rho is not None:
                             rotated_rho = rotate_kernel(base_weight_rho, angle_deg=angles[k])
-                            rotated_rho = rotate_kernel(rotated_rho, angle_deg=angles[g_out])
+                            rotated_rho = rotate_kernel(rotated_rho, angle_deg=angles[outer])
                             row_blocks_rho.append(rotated_rho)
                     expanded_mu.append(torch.cat(row_blocks_mu, dim=1))
                     if base_weight_rho is not None:
