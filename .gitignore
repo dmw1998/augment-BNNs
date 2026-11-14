@@ -23,3 +23,15 @@ results/
 .vscode/
 .idea/
 .DS_Store
+
+# Cluster-local: container image + build scripts, SLURM logs, account settings
+app/
+cluster.env
+*.sif
+logs/
+
+# Superseded standalone scripts (replaced by ebnn/ + scripts/)
+data_augmentation.py
+equivariance_val.py
+train_bayesian_CNN_no_fc_gaussian_gcnn.py
+nabarro_c4_compare.py

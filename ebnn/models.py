@@ -4,8 +4,6 @@
 * :class:`BayesianCNNConfigurable` -- conv-stack + FC head with a selectable variational family (Gaussian / Laplace / Log-Normal).  Used by the multi-family comparison.
 * :class:`BayesianFullyConvCNN` -- fully convolutional (1x1 conv classifier + global average pool), Gaussian posterior.
 * :class:`BayesianGroupConvCNN` -- group-conv variant with ``|G|x`` channels; weights are not tied during training (equivariance is imposed only at init by func `ebnn.symmetrize.expand_small_model_to_gcnn`).
-
-The fully-/group-convolutional models and the Gaussian configurable model build their layers with the zero-mean / ``softplus(0.693)~=1`` scale initialisation used by the original scripts.  For the fully-/group-conv trainer these values are overwritten at startup by the re-initialisation helpers in mod `ebnn.symmetrize`, so the choice only matters for keeping the RNG stream identical to the original runs.
 """
 
 from typing import List, Literal, Optional, Tuple
@@ -23,9 +21,13 @@ from ebnn.layers import (
 )
 from ebnn.symmetrize import rotate_kernel_c4
 
-# Initialisation used by every layer that descends from the original
-# ``train_bayesian_CNN`` Gaussian conv (zero mean, softplus(0.693) ~= 1 scale).
+# Construction-time init (zero mean, softplus(0.693) ~= 1 scale); the trainer
+# re-initialises the posterior afterwards.
 _FULLYCONV_GAUSSIAN_INIT = {"weight_mu_init": "zeros", "weight_rho_init": 0.693}
+
+# Multi-family model (not re-initialised by its trainer): Kaiming mean + small std;
+# a zero mean with std ~= 1 would start exactly at the N(0, 1) prior.
+_CONFIGURABLE_GAUSSIAN_INIT = {"weight_mu_init": "kaiming", "weight_rho_init": None}
 
 
 class BayesianCNN(nn.Module):
@@ -133,7 +135,7 @@ class BayesianCNNConfigurable(nn.Module):
                 "prior_std": prior_params.get("std", 1.0),
                 "rho_init": rho_init,
                 "random_prior": random_prior,
-                **_FULLYCONV_GAUSSIAN_INIT,
+                **_CONFIGURABLE_GAUSSIAN_INIT,
             }
         elif family == "laplace":
             conv_cls = BayesianConv2dLaplace
@@ -190,7 +192,7 @@ class BayesianCNNConfigurable(nn.Module):
                 prior_std=prior_std,
                 rho_init=self.rho_init,
                 random_prior=self.random_prior,
-                **_FULLYCONV_GAUSSIAN_INIT,
+                **_CONFIGURABLE_GAUSSIAN_INIT,
             )
 
     def forward(self, x: torch.Tensor, return_kl: bool = True, return_separate_kl: bool = False):

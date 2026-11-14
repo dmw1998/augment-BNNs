@@ -10,15 +10,21 @@
 
 The number of DataLoader workers is configurable (it does not affect results for
 the deterministic ``"without"`` / ``"full"`` modes).
+
+Datasets: MNIST / FashionMNIST / CIFAR10 / CIFAR100 (torchvision) and the
+NCT-CRC-HE colorectal histology set (:mod:`ebnn.histology`, ``"NCT_CRC_HE"``).
 """
 
 import hashlib
 import os
+import tempfile
 
 import torch
 import torchvision
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, Dataset
+
+from ebnn.histology import DEFAULT_IMAGE_SIZE, NCTCRCHE
 
 
 def _hash_int_list(values):
@@ -41,10 +47,23 @@ def _build_cache_path(cache_dir, prefix, dataset_name, suffix):
     return os.path.join(cache_dir, filename)
 
 
+def _atomic_torch_save(payload, path):
+    """``torch.save`` via a temp file + rename, so concurrent jobs never load a half-written cache."""
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+    os.close(fd)
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
 def get_base_transform(dataset_name="MNIST"):
     if dataset_name in ("MNIST", "FashionMNIST"):
         return T.Compose([T.ToTensor(), T.Normalize((0.5,), (0.5,))])
-    if dataset_name in ("CIFAR10", "CIFAR100"):
+    if dataset_name in ("CIFAR10", "CIFAR100", "NCT_CRC_HE"):
         return T.Compose([T.ToTensor(), T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
     raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -78,7 +97,7 @@ class C4AugmentedDataset(Dataset):
             self.angles_tensor = torch.tensor(angles_out, dtype=torch.long)
 
             if cache_path is not None:
-                torch.save(
+                _atomic_torch_save(
                     {"images": self.images, "labels": self.labels, "angles": self.angles_tensor},
                     cache_path,
                 )
@@ -157,7 +176,7 @@ class EquivarianceEvalSet(Dataset):
             self.labels = torch.tensor(labels, dtype=torch.long)
 
             if cache_path is not None:
-                torch.save(
+                _atomic_torch_save(
                     {
                         "img_0": self.img_0,
                         "img_90": self.img_90,
@@ -186,7 +205,22 @@ _DATASETS = {
     "FashionMNIST": torchvision.datasets.FashionMNIST,
     "CIFAR10": torchvision.datasets.CIFAR10,
     "CIFAR100": torchvision.datasets.CIFAR100,
+    "NCT_CRC_HE": NCTCRCHE,
 }
+
+_NUM_CLASSES = {
+    "MNIST": 10,
+    "FashionMNIST": 10,
+    "CIFAR10": 10,
+    "CIFAR100": 100,
+    "NCT_CRC_HE": len(NCTCRCHE.classes),
+}
+
+
+def get_num_classes(dataset_name):
+    if dataset_name not in _NUM_CLASSES:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    return _NUM_CLASSES[dataset_name]
 
 
 def get_loaders(
@@ -200,11 +234,12 @@ def get_loaders(
     cache_dir="./data/precomputed_aug",
     data_root="./data",
     num_workers=4,
+    image_size=None,
 ):
     """Build train / test / equivariance loaders.
 
     Args:
-        dataset_name: One of {MNIST, FashionMNIST, CIFAR10, CIFAR100}.
+        dataset_name: One of {MNIST, FashionMNIST, CIFAR10, CIFAR100, NCT_CRC_HE}.
         batch_size: Batch size for all loaders.
         train_size: N_0, number of base training samples (None = use all).
         use_augmentation: Deprecated boolean switch, kept for compatibility.
@@ -212,6 +247,11 @@ def get_loaders(
             over ``use_augmentation`` when provided.
         num_workers: DataLoader workers (does not affect results for the
             deterministic "without"/"full" modes).
+        image_size: NCT_CRC_HE only -- patch side length (None = native 224).
+            Its C4 orbit sets are always built in memory (``use_disk_cache`` is
+            ignored): the processed uint8 arrays already act as the on-disk
+            cache, and float32 orbit caches would take ~12 GB per N_0 = 5000
+            subset at 224 px.
     """
     if augmentation_mode is None:
         augmentation_mode = "full" if use_augmentation else "without"
@@ -220,10 +260,17 @@ def get_loaders(
     if dataset_name not in _DATASETS:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
+    dataset_kwargs = {}
+    if dataset_name == "NCT_CRC_HE":
+        dataset_kwargs["image_size"] = DEFAULT_IMAGE_SIZE if image_size is None else int(image_size)
+        use_disk_cache = False
+    elif image_size is not None:
+        raise ValueError(f"image_size is only supported for NCT_CRC_HE, not {dataset_name}")
+
     transform = get_base_transform(dataset_name)
     dataset_cls = _DATASETS[dataset_name]
-    base_train = dataset_cls(root=data_root, train=True, download=True, transform=transform)
-    base_test = dataset_cls(root=data_root, train=False, download=True, transform=transform)
+    base_train = dataset_cls(root=data_root, train=True, download=True, transform=transform, **dataset_kwargs)
+    base_test = dataset_cls(root=data_root, train=False, download=True, transform=transform, **dataset_kwargs)
 
     if train_size is not None and train_size < len(base_train):
         indices = torch.randperm(len(base_train))[:train_size]

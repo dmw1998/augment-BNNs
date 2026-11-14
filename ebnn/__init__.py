@@ -10,7 +10,9 @@ from ebnn.data import (
     RepeatedDataset,
     get_base_transform,
     get_loaders,
+    get_num_classes,
 )
+from ebnn.histology import NCTCRCHE
 from ebnn.layers import (
     BayesianConv2dGaussian,
     BayesianConv2dLaplace,
@@ -28,6 +30,7 @@ from ebnn.metrics import (
     compute_symmetric_kl_divergence,
     compute_symmetric_kl_divergence_mc,
     eval_pass,
+    evaluate_c4_orbit,
     evaluate_classification_accuracy,
     predict_probs_mc,
     run_validation,
@@ -38,7 +41,10 @@ from ebnn.models import (
     BayesianFullyConvCNN,
     BayesianGroupConvCNN,
 )
+from ebnn.orbit import OrbitAveragedBNN, c4_orbit
+from ebnn.p4cnn import BayesianP4CNN
 from ebnn.symmetrize import (
+    apply_c4_enforcement,
     apply_one_shot_c4_posterior_average,
     apply_one_shot_c4_projection,
     build_optimizer,
@@ -59,13 +65,18 @@ __all__ = [
     "BayesianConv2dLogNormal",
     "BayesianFullyConvCNN",
     "BayesianGroupConvCNN",
+    "BayesianP4CNN",
+    "OrbitAveragedBNN",
+    "c4_orbit",
     "BayesianLinearGaussian",
     "BayesianLinearLaplace",
     "BayesianLinearLogNormal",
     "C4AugmentedDataset",
     "EquivarianceEvalSet",
+    "NCTCRCHE",
     "RandomC4AugmentedDataset",
     "RepeatedDataset",
+    "apply_c4_enforcement",
     "apply_one_shot_c4_posterior_average",
     "apply_one_shot_c4_projection",
     "build_optimizer",
@@ -79,10 +90,12 @@ __all__ = [
     "compute_symmetric_kl_divergence_mc",
     "describe_optimizer",
     "eval_pass",
+    "evaluate_c4_orbit",
     "evaluate_classification_accuracy",
     "expand_small_model_to_gcnn",
     "get_base_transform",
     "get_loaders",
+    "get_num_classes",
     "initialize_gaussian_posterior_scale",
     "initialize_posterior_mean",
     "predict_probs_mc",

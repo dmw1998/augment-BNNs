@@ -7,6 +7,10 @@ helpers used by the unified trainer:
 * :func:`apply_one_shot_c4_projection` -- exact projection onto the C4-equivariant subspace.
 * :func:`apply_one_shot_c4_posterior_average` -- C4 posterior averaging over the orbit (geometric product-of-experts or arithmetic moment matching).
 * :func:`expand_small_model_to_gcnn` -- block-circulant expansion of a trained small model into a group-convolutional model.
+
+and the baseline that enforces equivariance throughout training instead:
+
+* :func:`apply_c4_enforcement` -- projection / averaging at init (rescaled back to the pre-symmetrisation norm), re-applied after every optimiser step.
 """
 
 import math
@@ -102,7 +106,9 @@ def _project_conv_weight_tensor(weight: torch.Tensor, first_layer: bool) -> torc
         if out_ch % 4 != 0 or in_ch < 1:
             return projected
         for g in range(out_ch // 4):
-            _project_first_layer_block(projected, group_out_start=4 * g, input_idx=0)
+            # every input channel (in_ch = 3 for RGB)
+            for c in range(in_ch):
+                _project_first_layer_block(projected, group_out_start=4 * g, input_idx=c)
         return projected
     if out_ch % 4 != 0 or in_ch % 4 != 0:
         return projected
@@ -320,6 +326,173 @@ def expand_small_model_to_gcnn(
 
 
 # --------------------------------------------------------------------------- #
+# Method: enforce -- symmetrise at init (norm-rescaled), then after every step
+# --------------------------------------------------------------------------- #
+# Vectorised versions of the ``proj`` block operators above: the per-block Python
+# loops are fine for a one-shot projection but far too slow to run after every
+# optimiser step.  They accumulate in the same order, so they reproduce the loop
+# versions exactly (checked in tests/test_smoke.py).
+def _project_lifting_weight_fast(weight: torch.Tensor) -> torch.Tensor:
+    """:func:`_project_first_layer_block` for all (output group, input channel) blocks at once."""
+    out_ch = weight.shape[0]
+    if out_ch % 4 != 0:
+        return weight.clone()
+    w = weight.reshape(out_ch // 4, 4, *weight.shape[1:])  # [G_out, r_out, C_in, kH, kW]
+    base = torch.zeros_like(w[:, 0])
+    for ii in range(4):
+        base += 0.25 * rotate_kernel_c4(w[:, (-ii) % 4], ii)
+    return torch.stack([rotate_kernel_c4(base, kk) for kk in range(4)], dim=1).reshape(weight.shape)
+
+
+def _project_group_weight_fast(weight: torch.Tensor) -> torch.Tensor:
+    """:func:`_project_group_block` for all (output group, input group) blocks at once."""
+    out_ch, in_ch = weight.shape[:2]
+    if out_ch % 4 != 0 or in_ch % 4 != 0:
+        return weight.clone()
+    w = weight.reshape(out_ch // 4, 4, in_ch // 4, 4, *weight.shape[2:])  # [G_out, r_out, G_in, r_in, kH, kW]
+    base = torch.zeros_like(w[:, 0])  # [G_out, G_in, (r_in - r_out) % 4, kH, kW]
+    for ii in range(4):
+        base += 0.25 * rotate_kernel_c4(w[:, (-ii) % 4][:, :, [(jj - ii) % 4 for jj in range(4)]], ii)
+    blocks = [rotate_kernel_c4(base[:, :, [(jj - kk) % 4 for jj in range(4)]], kk) for kk in range(4)]
+    return torch.stack(blocks, dim=1).reshape(weight.shape)
+
+
+def _average_classifier_groups(weight: torch.Tensor) -> torch.Tensor:
+    """Average a 1x1 classifier over the 4 channels of every C4 input group (invariant read-out)."""
+    c_out, c_in = weight.shape[:2]
+    assert c_in % 4 == 0
+    w = weight.reshape(c_out, c_in // 4, 4, *weight.shape[2:])
+    return w.mean(dim=2, keepdim=True).expand_as(w).reshape(weight.shape)
+
+
+def _average_bias_groups(bias: torch.Tensor) -> torch.Tensor:
+    """Vectorised :func:`_project_bias_mu_block` (mean over consecutive blocks of 4)."""
+    if bias.shape[0] % 4 != 0:
+        out = bias.clone()
+        _project_bias_mu_block(out)
+        return out
+    return bias.reshape(-1, 4).mean(dim=1, keepdim=True).expand(-1, 4).reshape(bias.shape)
+
+
+def _project_sigma_fast(rho: torch.Tensor, project_fn) -> torch.Tensor:
+    """Apply ``project_fn`` to sigma = softplus(rho) and map back, as :func:`_project_sigma_tensor`."""
+    eps = 1e-12
+    return inverse_softplus(project_fn(F.softplus(rho)).clamp_min(eps), eps=eps)
+
+
+def _apply_c4_projection_fast(model: nn.Module) -> None:
+    """Vectorised :func:`apply_one_shot_c4_projection` (in place).
+
+    Unlike the one-shot version it also averages the classifier's posterior
+    *scale* over each C4 group (the one-shot version averages only its mean), so
+    the enforced posterior is exactly invariant in distribution.
+    """
+    conv_layers: List[nn.Module] = list(getattr(model, "conv_layers", []))
+    for idx, layer in enumerate(conv_layers):
+        if not (hasattr(layer, "weight_mu") and isinstance(layer.weight_mu, nn.Parameter)):
+            continue
+        if layer.weight_mu.dim() != 4 or layer.weight_mu.shape[-1] < 3:
+            continue
+        project = _project_lifting_weight_fast if idx == 0 else _project_group_weight_fast
+        layer.weight_mu.data.copy_(project(layer.weight_mu.data))
+        if hasattr(layer, "weight_rho") and isinstance(layer.weight_rho, nn.Parameter):
+            layer.weight_rho.data.copy_(_project_sigma_fast(layer.weight_rho.data, project))
+        if hasattr(layer, "bias_mu") and isinstance(layer.bias_mu, nn.Parameter):
+            layer.bias_mu.data.copy_(_average_bias_groups(layer.bias_mu.data))
+        if hasattr(layer, "bias_rho") and isinstance(layer.bias_rho, nn.Parameter):
+            layer.bias_rho.data.copy_(_average_bias_groups(layer.bias_rho.data))
+
+    clf = getattr(model, "classifier", None)
+    if clf is not None and hasattr(clf, "weight_mu"):
+        clf.weight_mu.data.copy_(_average_classifier_groups(clf.weight_mu.data))
+        if hasattr(clf, "weight_rho") and isinstance(clf.weight_rho, nn.Parameter):
+            clf.weight_rho.data.copy_(_project_sigma_fast(clf.weight_rho.data, _average_classifier_groups))
+
+
+def _posterior_weight_norms(model: nn.Module) -> dict:
+    """Frobenius norms of every weight posterior mean and std, keyed by module name."""
+    norms = {}
+    for name, module in model.named_modules():
+        if not (hasattr(module, "weight_mu") and isinstance(module.weight_mu, nn.Parameter)):
+            continue
+        sigma_norm = None
+        if hasattr(module, "weight_rho") and isinstance(module.weight_rho, nn.Parameter):
+            sigma_norm = F.softplus(module.weight_rho).norm()
+        norms[name] = (module.weight_mu.norm(), sigma_norm)
+    return norms
+
+
+def _rescale_to_norms(model: nn.Module, norms: dict, eps: float = 1e-12) -> dict:
+    """Scale each weight mean / std back to its recorded norm. Returns ``{name: (mu_factor, sigma_factor)}``."""
+    modules = dict(model.named_modules())
+    factors = {}
+    for name, (mu_norm, sigma_norm) in norms.items():
+        module = modules[name]
+        mu_factor = sigma_factor = 1.0
+        new_mu_norm = module.weight_mu.norm()
+        if new_mu_norm > eps:
+            mu_factor = float(mu_norm / new_mu_norm)
+            if mu_factor != 1.0:
+                module.weight_mu.mul_(mu_factor)
+        if sigma_norm is not None:
+            new_sigma_norm = F.softplus(module.weight_rho).norm()
+            if new_sigma_norm > eps:
+                sigma_factor = float(sigma_norm / new_sigma_norm)
+                if sigma_factor != 1.0:
+                    module.weight_rho.copy_(_scale_rho_std(module.weight_rho, sigma_factor))
+        factors[name] = (mu_factor, sigma_factor)
+    return factors
+
+
+def apply_with_norm_rescale(model: nn.Module, symmetrize_fn) -> dict:
+    """Run ``symmetrize_fn(model)``, then scale each weight mean / std back to its pre-symmetrisation norm.
+
+    Used by ``--method avg`` / ``proj`` with ``--sym_rescale``: the one-shot operator
+    followed by the same per-layer rescaling as ``--enforce_rescale init`` (one scalar
+    for the mean and one for the std of every weight tensor, so the weights stay in
+    the equivariant subspace), after which training continues unconstrained.
+
+    Returns ``{module_name: (mu_factor, sigma_factor)}``.
+    """
+    with torch.no_grad():
+        norms = _posterior_weight_norms(model)
+        symmetrize_fn(model)
+        return _rescale_to_norms(model, norms)
+
+
+def apply_c4_enforcement(
+    model: nn.Module,
+    op: Literal["proj", "avg"] = "proj",
+    avg_method: Literal["geometric", "arithmetic"] = "geometric",
+    rescale: bool = False,
+) -> dict:
+    """Symmetrise the posterior in place with ``op``, optionally restoring each weight tensor's norm.
+
+    Used by ``--method enforce`` (equivariance enforced throughout training):
+    once at init with ``rescale=True`` -- projection / averaging shrinks i.i.d.
+    random weights by ~2x (``proj``: orbits of size 4) or ~sqrt(3)x (``avg`` on
+    3x3 kernels), which would shrink the activations of the initial network --
+    and then after every optimiser step without rescaling (projected SGD).
+    Rescaling multiplies each layer's posterior mean and std by one scalar each,
+    so the weights stay in the equivariant subspace.
+
+    ``op="proj"`` is :func:`_apply_c4_projection_fast`; ``op="avg"`` is
+    :func:`apply_one_shot_c4_posterior_average` with ``avg_method``.
+
+    Returns ``{module_name: (mu_factor, sigma_factor)}`` if ``rescale`` else ``{}``.
+    """
+    if op not in ("proj", "avg"):
+        raise ValueError(f"Unknown enforce op: {op!r} (expected 'proj' or 'avg')")
+    with torch.no_grad():
+        norms = _posterior_weight_norms(model) if rescale else None
+        if op == "proj":
+            _apply_c4_projection_fast(model)
+        else:
+            apply_one_shot_c4_posterior_average(model, method=avg_method)
+        return _rescale_to_norms(model, norms) if rescale else {}
+
+
+# --------------------------------------------------------------------------- #
 # Posterior (re-)initialisation
 # --------------------------------------------------------------------------- #
 def initialize_posterior_mean(model: nn.Module, posterior_init: str = "zero"):
@@ -393,7 +566,12 @@ def initialize_gaussian_posterior_scale(model: nn.Module, rho_init: float):
 # Optimiser construction + buffer reset
 # --------------------------------------------------------------------------- #
 def _is_rho(param_name: str) -> bool:
-    return param_name.endswith("rho")  # weight_rho / bias_rho
+    # Posterior scale parameters across families: Gaussian/LogNormal use
+    # weight_rho / bias_rho; Laplace uses weight_log_scale / bias_log_scale.
+    # Grouping them together keeps the scale parameters out of weight decay
+    # (otherwise decay inflates the Laplace softplus scale and destabilises
+    # training) and gives every family the same scale learning rate.
+    return param_name.endswith("rho") or param_name.endswith("log_scale")
 
 
 def build_optimizer(

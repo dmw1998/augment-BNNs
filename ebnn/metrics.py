@@ -1,7 +1,5 @@
 """Equivariance and accuracy metrics.
 
-Consolidates the metric functions that were previously split across ``equivariance_val.py`` (single-sample and the core defect), the unified trainer (MC-averaged variants), and the Theorem-4 script (T-sweep and K-fold defect).
-
 For classification the group acts trivially on the label space, so the equivariance defect measures how much the predictive distribution changes under input rotation:
 
     Delta_F^eq = (1/N) sum_i (1/|G|) sum_g || F_mc(g x_i) - F_mc(x_i) ||^2,
@@ -96,7 +94,7 @@ def evaluate_classification_accuracy(model, device, test_loader, mc_samples=1):
 # Single-sample (mean-weight) equivariance metrics
 # --------------------------------------------------------------------------- #
 def compute_orbits_same_pred(model, device, equiv_loader):
-    """Mean over samples of (1/|G|) sum_g 1[pred(g x) == pred(x)] using mean weights."""
+    """Mean over samples of (max orbit-vote count) / |G| using mean weights."""
     total_indicator_sum = 0.0
     total_samples = 0
     model.eval()
@@ -111,9 +109,8 @@ def compute_orbits_same_pred(model, device, equiv_loader):
                 preds.append(model(img, return_kl=False).argmax(dim=1).cpu())
             preds = torch.stack(preds)  # [4, batch]
             for i in range(preds.shape[1]):
-                pred_0 = preds[0, i]
-                indicator_sum = sum(0.25 for j in range(4) if preds[j, i] == pred_0)
-                total_indicator_sum += indicator_sum
+                _, counts = torch.unique(preds[:, i], return_counts=True)
+                total_indicator_sum += counts.max().item() / 4.0
                 total_samples += 1
     return total_indicator_sum / total_samples if total_samples > 0 else 0.0
 
@@ -202,27 +199,92 @@ def compute_symmetric_kl_divergence_mc(model, equiv_loader, device, eval_samples
     return {"mean": 0.0, "std": 0.0}
 
 
-def run_validation(model, test_loader, equiv_loader, device, eval_samples, val_source):
-    """Bundle accuracy/loss with the MC equivariance metrics. Returns (metrics, distribution)."""
-    val_acc, val_loss, val_dist = eval_pass(
-        model,
-        test_loader,
-        equiv_loader,
-        device,
-        eval_samples,
-        eval_source=val_source,
-        return_distribution=True,
-    )
-    osp = compute_orbits_same_pred_mc(model, equiv_loader, device, eval_samples)
-    kl = compute_symmetric_kl_divergence_mc(model, equiv_loader, device, eval_samples)
-    metrics = {
-        "val/accuracy": val_acc,
-        "val/loss": val_loss,
-        "val/osp": osp,
-        "val/symmetric_kl_div_mean": kl["mean"],
-        "val/symmetric_kl_div_std": kl["std"],
+def evaluate_c4_orbit(model, equiv_loader, device, eval_samples):
+    """Accuracy, NLL, OSP and symmetric KL from ONE MC pass over the C4 orbit of every test image.
+
+    Each rotation gets its own ``eval_samples`` posterior draws, exactly as in
+    :func:`compute_orbits_same_pred_mc` / :func:`compute_symmetric_kl_divergence_mc`, and the
+    same predictive distributions feed every metric:
+
+    * ``acc_c4`` / ``loss_c4``     -- on the C4-augmented test set (all four rotations);
+    * ``acc_orig`` / ``loss_orig`` -- on the original (0-degree) images only;
+    * ``osp``, ``kl_mean`` / ``kl_std`` -- identical definitions to the two functions above
+      (the symmetric KL keeps their ``batchmean``-over-classes normalisation).
+
+    ``pred_c4`` / ``pred_orig`` hold the predicted labels (for the wandb histogram).
+    """
+    model.eval()
+    eps = 1e-8
+    correct = torch.zeros(4)
+    nll = torch.zeros(4)
+    count = 0
+    osp_sum = 0.0
+    kl_values = []
+    preds_all = []
+    with torch.no_grad():
+        for batch in equiv_loader:
+            if len(batch) != 5:
+                continue
+            *imgs, targets = batch
+            probs = torch.stack([predict_probs_mc(model, img.to(device), eval_samples).cpu() for img in imgs])
+            preds = probs.argmax(dim=2)  # [4, batch]
+            for r in range(4):
+                correct[r] += preds[r].eq(targets).sum().item()
+                nll[r] += F.nll_loss(torch.log(probs[r].clamp_min(1e-12)), targets, reduction="sum").item()
+            # Orbit-same-prediction: size of the largest vote among the 4 rotations / 4.
+            votes = (preds.unsqueeze(0) == preds.unsqueeze(1)).sum(dim=0)  # [4, batch]
+            osp_sum += (votes.max(dim=0).values.float() / 4.0).sum().item()
+            # Symmetric KL(p_0, p_g) for g = 90/180/270; KL(p||q) + KL(q||p) = sum (p - q)(log p - log q).
+            p0 = probs[0] + eps
+            for j in (1, 2, 3):
+                p_rot = probs[j] + eps
+                sym = ((p_rot - p0) * (p_rot.log() - p0.log())).sum(dim=1) / probs.shape[2]
+                kl_values.extend(sym.tolist())
+            count += targets.size(0)
+            preds_all.append(preds)
+    preds_all = torch.cat(preds_all, dim=1) if preds_all else torch.empty(4, 0, dtype=torch.long)
+    return {
+        "acc_c4": 100.0 * correct.sum().item() / (4 * count),
+        "loss_c4": nll.sum().item() / (4 * count),
+        "acc_orig": 100.0 * correct[0].item() / count,
+        "loss_orig": nll[0].item() / count,
+        "osp": osp_sum / count,
+        "kl_mean": float(np.mean(kl_values)) if kl_values else 0.0,
+        "kl_std": float(np.std(kl_values)) if kl_values else 0.0,
+        "pred_c4": preds_all.flatten().numpy(),
+        "pred_orig": preds_all[0].numpy(),
     }
-    return metrics, val_dist
+
+
+def run_validation(model, test_loader, equiv_loader, device, eval_samples, val_source):
+    """Accuracy/loss and the MC equivariance metrics in one pass. Returns (metrics, distribution).
+
+    ``val/accuracy`` / ``val/loss`` (the best-checkpoint criterion) follow ``val_source``:
+    ``"equiv_all"`` = the C4-augmented test set, ``"test"`` = the original test images.  Both
+    variants are always logged as ``val/accuracy_c4`` / ``val/accuracy_orig`` (and the losses).
+    The original images are the 0-degree slot of ``equiv_loader``, i.e. the whole test set
+    when ``get_loaders`` is called with ``n_eval_samples=None`` (the default);
+    ``test_loader`` is kept in the signature for compatibility and is not iterated.
+    """
+    res = evaluate_c4_orbit(model, equiv_loader, device, eval_samples)
+    if val_source == "equiv_all":
+        key = "c4"
+    elif val_source == "test":
+        key = "orig"
+    else:
+        raise ValueError(f"Unknown eval_source: {val_source}")
+    metrics = {
+        "val/accuracy": res[f"acc_{key}"],
+        "val/loss": res[f"loss_{key}"],
+        "val/accuracy_c4": res["acc_c4"],
+        "val/loss_c4": res["loss_c4"],
+        "val/accuracy_orig": res["acc_orig"],
+        "val/loss_orig": res["loss_orig"],
+        "val/osp": res["osp"],
+        "val/symmetric_kl_div_mean": res["kl_mean"],
+        "val/symmetric_kl_div_std": res["kl_std"],
+    }
+    return metrics, {"pred_labels": res[f"pred_{key}"]}
 
 
 # --------------------------------------------------------------------------- #

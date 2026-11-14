@@ -1,14 +1,14 @@
 """Bayesian (variational) layers for mean-field VI.
 
-This module consolidates the layer definitions that previously lived (in three near-identical copies) inside the individual training scripts.  The Gaussian layers support two posterior-mean / posterior-scale initialisation regimes via explicit constructor arguments, so that every original script can be reproduced without silently changing its initialisation:
+The Gaussian layers support two initialisations:
 
-* ``weight_mu_init="kaiming", weight_rho_init=None``  reproduces the layers used by the Theorem-2 / Theorem-4 baselines (Kaiming mean init, ``rho_init`` scale).
-* ``weight_mu_init="zeros", weight_rho_init=0.693``    reproduces the layers used by the multi-family / fully-convolutional models (zero mean, ``softplus(0.693)~= 1`` scale).
+* ``weight_mu_init="kaiming", weight_rho_init=None`` -- Kaiming mean, ``rho_init`` scale
+  (Theorem-2 / Theorem-4 models).
+* ``weight_mu_init="zeros", weight_rho_init=0.693``  -- zero mean, ``softplus(0.693) ~= 1``
+  scale (multi-family / fully-convolutional models).
 
-All Gaussian layers expose the prior under the attribute names ``prior_mu`` and
-``prior_std`` (Python floats for an isotropic prior, registered buffers for a
-random prior) so that the symmetrisation / re-initialisation utilities in
-:mod:`ebnn.symmetrize` can read them uniformly.
+All Gaussian layers expose the prior as ``prior_mu`` / ``prior_std`` (floats for an
+isotropic prior, buffers for a random prior), as read by :mod:`ebnn.symmetrize`.
 """
 
 from typing import Optional, Tuple, Union
@@ -177,7 +177,8 @@ class BayesianLinearLaplace(nn.Module):
         self.out_features = out_features
         self.prior_scale = prior_scale
 
-        self.weight_mu = nn.Parameter(torch.zeros(out_features, in_features))
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_normal_(self.weight_mu, mode="fan_in", nonlinearity="relu")
         self.weight_log_scale = nn.Parameter(torch.randn(out_features, in_features) * 0.1 - 5)
 
         self.bias_mu = nn.Parameter(torch.zeros(out_features))
@@ -217,7 +218,8 @@ class BayesianConv2dLaplace(nn.Module):
         self.prior_scale = prior_scale
         self.weight_shape = (out_channels, in_channels, kernel_size, kernel_size)
 
-        self.weight_mu = nn.Parameter(torch.zeros(self.weight_shape))
+        self.weight_mu = nn.Parameter(torch.empty(self.weight_shape))
+        nn.init.kaiming_normal_(self.weight_mu, mode="fan_in", nonlinearity="relu")
         self.weight_log_scale = nn.Parameter(torch.randn(self.weight_shape) * 0.1 - 5)
 
         self.bias_mu = nn.Parameter(torch.zeros(out_channels))

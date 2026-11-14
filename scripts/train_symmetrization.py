@@ -1,22 +1,27 @@
-"""Unified C4-equivariant Bayesian CNN trainer.
+"""Unified trainer for C4-symmetrised Bayesian CNNs (mean-field Gaussian VI).
 
-Trains a fully-convolutional Bayesian CNN and induces C4 equivariance via one of
-three mechanisms (selected with ``--method``):
+``--method``:
 
-* ``avg``  -- one-shot C4 posterior averaging (geometric PoE / arithmetic).
-* ``proj`` -- one-shot projection onto the C4-equivariant subspace.
-* ``gcnn`` -- block-circulant expansion of a trained small model into a GCNN.
+* ``avg``      -- one-shot C4 posterior averaging (geometric PoE / arithmetic).
+* ``proj``     -- one-shot projection onto the C4-equivariant subspace.
+* ``gcnn``     -- orbit expansion of a trained small model into a group-conv model.
+* ``baseline`` -- augmented training only.
+* ``enforce``  -- ``--enforce_op`` proj / avg at init, re-applied after every step.
+* ``p4cnn``    -- Bayesian C4 G-CNN, equivariant by construction (:mod:`ebnn.p4cnn`).
+* ``orbit``    -- orbit-averaged likelihood of Nabarro et al. (2022) (:mod:`ebnn.orbit`).
 
-For ``avg`` / ``proj`` the symmetrisation is applied mid-training, triggered by either a training-accuracy threshold (``--trigger_acc``) or an epoch (``--trigger_epoch``); optimiser buffers are cleared afterwards so that stale (non-equivariant) momentum does not leak through the symmetrisation.
-
-The defaults reproduce the canonical run (gcnn + SGD, FashionMNIST, N0=5000,
-conv_channels=[32, 64], 100+400 stage epochs, lr=1e-2, weight_decay=0, Nesterov),
-so the bare command runs that configuration:
+``avg`` / ``proj`` are triggered by ``--trigger_acc`` or ``--trigger_epoch``; optimiser
+buffers are then cleared, and ``--sym_rescale`` restores every weight tensor to its
+pre-symmetrisation norm.  ``--conv_channels`` is the width of every method (``gcnn``:
+stage-2 width, stage 1 uses ``conv_channels // group_size``; ``p4cnn``:
+``conv_channels // 4`` fields x 4 rotations).
 
 Example:
-    python scripts/train_symmetrization.py                 # canonical gcnn+SGD run (seed 13)
-    python scripts/train_symmetrization.py --seed 7        # same config, different seed
-    python scripts/train_symmetrization.py --method proj --optimizer adamw --no-nesterov
+    python scripts/train_symmetrization.py                 # gcnn + SGD, FashionMNIST, N0 = 5000
+    python scripts/train_symmetrization.py --method proj --trigger_epoch 20
+    python scripts/train_symmetrization.py --method enforce --enforce_op proj
+    python scripts/train_symmetrization.py --method orbit --orbit_lik prob
+    python scripts/train_symmetrization.py --dataset NCT_CRC_HE --method gcnn --per_sample_backward
 """
 
 import argparse
@@ -27,12 +32,18 @@ import torch
 import torch.nn as nn
 import wandb
 
-from ebnn.data import get_loaders
+from ebnn.data import get_loaders, get_num_classes
+from ebnn.histology import DEFAULT_IMAGE_SIZE
 from ebnn.metrics import run_validation
 from ebnn.models import BayesianFullyConvCNN, BayesianGroupConvCNN
+from ebnn.orbit import ORBIT_LIKELIHOODS, OrbitAveragedBNN
+from ebnn.p4cnn import GROUP_SIZE as P4_GROUP_SIZE
+from ebnn.p4cnn import BayesianP4CNN
 from ebnn.symmetrize import (
+    apply_c4_enforcement,
     apply_one_shot_c4_posterior_average,
     apply_one_shot_c4_projection,
+    apply_with_norm_rescale,
     build_optimizer,
     clear_optimizer_state,
     describe_optimizer,
@@ -67,7 +78,16 @@ def train_phase(
     trigger_acc=None,
     trigger_epoch=None,
     clear_state_on_symmetrize=True,
+    post_step_fn=None,
+    per_sample_backward=False,
 ):
+    """Train ``model`` for ``num_epochs`` with periodic validation.
+
+    ``post_step_fn(model)``, if given, runs after every optimiser step (used by
+    ``enforce`` to re-symmetrise).  ``per_sample_backward`` backpropagates each MC
+    sample separately: the same gradient as one backward of the averaged loss, but
+    only one sample's graph is held in memory at a time.
+    """
     criterion = nn.CrossEntropyLoss()
     best_acc = 0.0
     best_state = None
@@ -78,10 +98,7 @@ def train_phase(
     def _validate(global_epoch, extra=None):
         nonlocal best_acc, best_state, best_epoch, best_metrics
         metrics, val_dist = run_validation(model, test_loader, equiv_loader, device, eval_samples, val_source)
-        # An epoch is eligible for "best" only once the reported model exists.
-        # For avg/proj that means AFTER symmetrisation (pre-symm epochs are not
-        # equivariant); gcnn phases have no symmetrize_fn so every epoch is
-        # eligible (stage1 best seeds the expansion; stage2 best is reported).
+        # avg / proj: only epochs after the symmetrisation count as "best".
         best_eligible = (symmetrize_fn is None) or sym_applied
         if best_eligible and metrics["val/accuracy"] >= best_acc:
             best_acc = metrics["val/accuracy"]
@@ -146,16 +163,23 @@ def train_phase(
             logits_last = None
             for _ in range(train_samples):
                 logits, kl = model(inputs, return_kl=True)
-                nll_sum = nll_sum + criterion(logits, targets)
+                nll = criterion(logits, targets)
+                if per_sample_backward:
+                    ((nll + beta * kl) / train_samples).backward()
+                    nll, kl = nll.detach(), kl.detach()
+                nll_sum = nll_sum + nll
                 kl_sum = kl_sum + kl
                 logits_last = logits
 
             nll_avg = nll_sum / train_samples
             kl_avg = kl_sum / train_samples
             loss = nll_avg + beta * kl_avg
-            loss.backward()
+            if not per_sample_backward:
+                loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            if post_step_fn is not None:
+                post_step_fn(model)
 
             total_loss += loss.item() * inputs.size(0)
             total_nll += nll_avg.item() * inputs.size(0)
@@ -194,7 +218,9 @@ def train_phase(
             f"[{tag}] BEST val/acc={best_acc:.2f}% @ epoch {best_epoch} | "
             f"osp={best_metrics['val/osp']:.4f} "
             f"sym_kl={best_metrics['val/symmetric_kl_div_mean']:.4f} "
-            f"val_loss={best_metrics['val/loss']:.4f}"
+            f"val_loss={best_metrics['val/loss']:.4f} | "
+            f"acc_c4={best_metrics['val/accuracy_c4']:.2f}% "
+            f"acc_orig={best_metrics['val/accuracy_orig']:.2f}% (selected by {val_source})"
         )
         if use_wandb:
             prefix = f"best/{tag}/" if stage_tag is not None else "best/"
@@ -202,6 +228,8 @@ def train_phase(
                 prefix + "epoch": best_epoch,
                 prefix + "val_accuracy": best_acc,
                 prefix + "val_loss": best_metrics["val/loss"],
+                prefix + "val_accuracy_c4": best_metrics["val/accuracy_c4"],
+                prefix + "val_accuracy_orig": best_metrics["val/accuracy_orig"],
                 prefix + "osp": best_metrics["val/osp"],
                 prefix + "symmetric_kl_div_mean": best_metrics["val/symmetric_kl_div_mean"],
                 prefix + "symmetric_kl_div_std": best_metrics["val/symmetric_kl_div_std"],
@@ -223,12 +251,12 @@ def train_phase(
 # --------------------------------------------------------------------------- #
 # Per-method drivers
 # --------------------------------------------------------------------------- #
-def _build_fcnn(args, in_channels, device):
+def _build_fcnn(args, in_channels, device, conv_channels=None):
     model = BayesianFullyConvCNN(
         in_channels=in_channels,
-        num_classes=10,
+        num_classes=args.num_classes,
         prior_params={"std": args.prior_std},
-        conv_channels=args.conv_channels,
+        conv_channels=args.conv_channels if conv_channels is None else conv_channels,
         rho_init=args.rho_init,
         random_prior=args.random_prior,
     ).to(device)
@@ -260,20 +288,51 @@ def run_avg_or_proj(args, loaders, in_channels, device):
     optimizer = _make_optimizer(model, args)
     beta = (1.0 / len(train_loader.dataset)) if args.beta is None else args.beta
 
+    post_step_fn = None
     if args.method == "baseline":
-        # No symmetrization: plain augmented training. With symmetrize_fn=None,
-        # every epoch is eligible for the best-accuracy checkpoint.
         symmetrize_fn = None
         label = "baseline"
     elif args.method == "proj":
         symmetrize_fn = apply_one_shot_c4_projection
         label = "proj"
+    elif args.method == "enforce":
+        label = "enforce/" + ("proj" if args.enforce_op == "proj" else f"avg/{args.avg_method}")
+
+        def symmetrize_fn(m):
+            factors = apply_c4_enforcement(
+                m,
+                op=args.enforce_op,
+                avg_method=args.avg_method,
+                rescale=args.enforce_rescale in ("init", "always"),
+            )
+            if factors:
+                print(
+                    f"[{label}] init rescale factors (mu, sigma): "
+                    + ", ".join(f"{name} ({mu:.3f}, {sig:.3f})" for name, (mu, sig) in factors.items())
+                )
+
+        def post_step_fn(m):
+            apply_c4_enforcement(
+                m, op=args.enforce_op, avg_method=args.avg_method, rescale=args.enforce_rescale == "always"
+            )
+
     else:
 
         def symmetrize_fn(m):
             return apply_one_shot_c4_posterior_average(m, method=args.avg_method)
 
         label = f"avg/{args.avg_method}"
+
+    if args.sym_rescale and args.method in ("avg", "proj"):
+        one_shot_fn = symmetrize_fn
+        label = label + "+rescale"
+
+        def symmetrize_fn(m):
+            factors = apply_with_norm_rescale(m, one_shot_fn)
+            print(
+                f"[{label}] rescale factors (mu, sigma): "
+                + ", ".join(f"{name} ({mu:.3f}, {sig:.3f})" for name, (mu, sig) in factors.items())
+            )
 
     result = train_phase(
         model,
@@ -294,8 +353,9 @@ def run_avg_or_proj(args, loaders, in_channels, device):
         trigger_acc=args.trigger_acc,
         trigger_epoch=args.trigger_epoch,
         clear_state_on_symmetrize=not args.no_clear_state,
+        post_step_fn=post_step_fn,
+        per_sample_backward=args.per_sample_backward,
     )
-    # Return the best-val checkpoint (the model we report), not the final epoch.
     if result["best_state"] is not None:
         model.load_state_dict(result["best_state"])
     return model
@@ -305,8 +365,10 @@ def run_gcnn(args, loaders, in_channels, device):
     train_loader, test_loader, equiv_loader = loaders
     beta = (1.0 / len(train_loader.dataset)) if args.beta is None else args.beta
 
+    base_channels = [c // args.group_size for c in args.conv_channels]
     print("\n" + "=" * 60 + "\nSTAGE 1: small baseline model\n" + "=" * 60)
-    small_model = _build_fcnn(args, in_channels, device)  # conv_channels used as base channels
+    print(f"[gcnn] stage-1 channels {base_channels} -> stage-2 channels {args.conv_channels}")
+    small_model = _build_fcnn(args, in_channels, device, conv_channels=base_channels)
     if args.stage1_epochs == 0:
         best_small_state = copy.deepcopy(small_model.state_dict())
         print("Stage 1 skipped (stage1_epochs=0).")
@@ -327,6 +389,7 @@ def run_gcnn(args, loaders, in_channels, device):
             val_source=args.val_source,
             use_wandb=not args.no_wandb,
             stage_tag="stage1",
+            per_sample_backward=args.per_sample_backward,
         )
         best_small_state = stage1_result["best_state"]
     if best_small_state is None:
@@ -336,9 +399,9 @@ def run_gcnn(args, loaders, in_channels, device):
     print("\n" + "=" * 60 + "\nSTAGE 2: expand to GCNN and train\n" + "=" * 60)
     gcnn_model = BayesianGroupConvCNN(
         in_channels=in_channels,
-        num_classes=10,
+        num_classes=args.num_classes,
         prior_params={"std": args.prior_std},
-        base_channels=args.conv_channels,
+        base_channels=base_channels,
         group_size=args.group_size,
         rho_init=args.rho_init,
         random_prior=args.random_prior,
@@ -365,10 +428,89 @@ def run_gcnn(args, loaders, in_channels, device):
         use_wandb=not args.no_wandb,
         stage_tag="stage2",
         start_epoch=args.stage1_epochs,
+        per_sample_backward=args.per_sample_backward,
     )
     if stage2_result["best_state"] is not None:
         gcnn_model.load_state_dict(stage2_result["best_state"])
     return gcnn_model
+
+
+def run_p4cnn(args, loaders, in_channels, device):
+    """Bayesian C4 G-CNN trained from scratch for ``--epochs`` (no symmetrisation step needed)."""
+    train_loader, test_loader, equiv_loader = loaders
+    beta = (1.0 / len(train_loader.dataset)) if args.beta is None else args.beta
+
+    fields = [c // P4_GROUP_SIZE for c in args.conv_channels]  # 4 rotations per field
+    model = BayesianP4CNN(
+        in_channels=in_channels,
+        num_classes=args.num_classes,
+        prior_params={"std": args.prior_std},
+        base_channels=fields,
+        rho_init=args.rho_init,
+        random_prior=args.random_prior,
+    ).to(device)
+    initialize_posterior_mean(model, posterior_init=args.posterior_init)
+    if args.posterior_init != "prior":
+        initialize_gaussian_posterior_scale(model, rho_init=args.rho_init)
+    n_free = sum(p.numel() for name, p in model.named_parameters() if name.endswith("_mu"))
+    print(
+        f"P4CNN channels {args.conv_channels} = fields {fields} x 4 rotations: {n_free} free posterior means"
+    )
+
+    optimizer = _make_optimizer(model, args)
+    result = train_phase(
+        model,
+        train_loader,
+        test_loader,
+        equiv_loader,
+        device,
+        optimizer,
+        num_epochs=args.epochs,
+        beta=beta,
+        train_samples=args.train_samples,
+        eval_samples=args.eval_samples,
+        val_interval=args.val_interval,
+        val_source=args.val_source,
+        use_wandb=not args.no_wandb,
+        per_sample_backward=args.per_sample_backward,
+    )
+    if result["best_state"] is not None:
+        model.load_state_dict(result["best_state"])
+    return model
+
+
+def run_orbit(args, loaders, in_channels, device):
+    """Orbit-averaged likelihood (Nabarro et al., 2022); everything but the likelihood as for avg / proj."""
+    train_loader, test_loader, equiv_loader = loaders
+    beta = (1.0 / len(train_loader.dataset)) if args.beta is None else args.beta
+
+    base = _build_fcnn(args, in_channels, device)
+    model = OrbitAveragedBNN(base, likelihood=args.orbit_lik).to(device)
+    print(
+        f"Orbit-averaged likelihood ({args.orbit_lik}) on BayesianFullyConvCNN {args.conv_channels}: "
+        f"one posterior sample per C4 orbit, 4x forward cost"
+    )
+
+    optimizer = _make_optimizer(model, args)
+    result = train_phase(
+        model,
+        train_loader,
+        test_loader,
+        equiv_loader,
+        device,
+        optimizer,
+        num_epochs=args.epochs,
+        beta=beta,
+        train_samples=args.train_samples,
+        eval_samples=args.eval_samples,
+        val_interval=args.val_interval,
+        val_source=args.val_source,
+        use_wandb=not args.no_wandb,
+        per_sample_backward=args.per_sample_backward,
+    )
+    if result["best_state"] is not None:
+        model.load_state_dict(result["best_state"])
+    return model
 
 
 # --------------------------------------------------------------------------- #
@@ -377,11 +519,25 @@ def run_gcnn(args, loaders, in_channels, device):
 def build_arg_parser():
     p = argparse.ArgumentParser(description="Unified C4-equivariant Bayesian CNN trainer")
 
-    p.add_argument("--method", type=str, default="gcnn", choices=["avg", "proj", "gcnn", "baseline"])
+    p.add_argument(
+        "--method",
+        type=str,
+        default="gcnn",
+        choices=["avg", "proj", "gcnn", "baseline", "enforce", "p4cnn", "orbit"],
+    )
     p.add_argument("--optimizer", type=str, default="sgd", choices=["adamw", "sgd"])
 
     p.add_argument(
-        "--dataset", type=str, default="FashionMNIST", choices=["MNIST", "FashionMNIST", "CIFAR10"]
+        "--dataset",
+        type=str,
+        default="FashionMNIST",
+        choices=["MNIST", "FashionMNIST", "CIFAR10", "NCT_CRC_HE"],
+    )
+    p.add_argument(
+        "--image_size",
+        type=int,
+        default=None,
+        help=f"NCT_CRC_HE only: patch side length (default {DEFAULT_IMAGE_SIZE} = native).",
     )
     p.add_argument("--train_size", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=128)
@@ -390,7 +546,8 @@ def build_arg_parser():
         type=int,
         nargs="+",
         default=None,
-        help="Channels per conv layer (base channels for gcnn).",
+        help="Feature-map channels per conv layer, for every method (gcnn: stage-2 width, its stage-1 "
+        "model has conv_channels // group_size; p4cnn: conv_channels // 4 fields x 4 rotations).",
     )
     p.add_argument("--prior_std", type=float, default=1.0)
     p.add_argument("--rho_init", type=float, default=-3.0)
@@ -418,17 +575,27 @@ def build_arg_parser():
 
     p.add_argument("--beta", type=float, default=None, help="KL weight (default 1/N).")
     p.add_argument("--train_samples", type=int, default=10)
+    p.add_argument(
+        "--per_sample_backward",
+        action="store_true",
+        help="Backpropagate each MC training sample separately: same gradient, ~train_samples x less "
+        "activation memory (needed for the GCNN at 224 px).",
+    )
     p.add_argument("--eval_samples", type=int, default=16)
-    p.add_argument("--epochs", type=int, default=500, help="avg/proj epochs.")
+    p.add_argument("--epochs", type=int, default=500, help="avg/proj/baseline/enforce/p4cnn/orbit epochs.")
     p.add_argument("--stage1_epochs", type=int, default=100, help="gcnn stage-1 epochs.")
     p.add_argument("--stage2_epochs", type=int, default=400, help="gcnn stage-2 epochs.")
     p.add_argument("--val_interval", type=int, default=5)
     p.add_argument(
         "--val_source",
         type=str,
-        default="test",
+        default="equiv_all",
         choices=["test", "equiv_all"],
-        help="Source for val/accuracy+loss; osp/sym_kl always use equiv_loader.",
+        help=(
+            "Source for val/accuracy+loss and the best checkpoint: equiv_all = C4-augmented test set "
+            "(all 4 rotations), test = original test images. Both are always logged "
+            "(val/accuracy_c4, val/accuracy_orig); osp/sym_kl always use the full orbit."
+        ),
     )
 
     trig = p.add_mutually_exclusive_group()
@@ -443,7 +610,37 @@ def build_arg_parser():
     )
     p.add_argument("--avg_method", type=str, default="geometric", choices=["geometric", "arithmetic"])
     p.add_argument(
+        "--orbit_lik",
+        type=str,
+        default="prob",
+        choices=list(ORBIT_LIKELIHOODS),
+        help="orbit (Nabarro et al., 2022): average the 4 rotations' softmax probabilities (prob) "
+        "or logits (logit) under one shared posterior sample.",
+    )
+    p.add_argument(
+        "--sym_rescale",
+        action="store_true",
+        help="avg / proj: after the one-shot symmetrisation, rescale each weight tensor (posterior "
+        "mean and std) back to its pre-symmetrisation norm (as --enforce_rescale init), then train "
+        "unconstrained.",
+    )
+    p.add_argument(
         "--no_clear_state", action="store_true", help="Do NOT clear optimizer buffers after symmetrization."
+    )
+    p.add_argument(
+        "--enforce_op",
+        type=str,
+        default="proj",
+        choices=["proj", "avg"],
+        help="enforce: operator applied at init and after every optimizer step (avg uses --avg_method).",
+    )
+    p.add_argument(
+        "--enforce_rescale",
+        type=str,
+        default="init",
+        choices=["init", "always", "none"],
+        help="enforce: rescale each weight tensor (posterior mean and std) back to its "
+        "pre-symmetrisation norm at init only / after every application / never.",
     )
 
     p.add_argument("--group_size", type=int, default=4)
@@ -472,10 +669,22 @@ def main():
 
     if args.method in ("avg", "proj") and args.trigger_acc is None and args.trigger_epoch is None:
         args.trigger_acc = 50.0
+    if args.sym_rescale and args.method not in ("avg", "proj"):
+        raise SystemExit(f"--sym_rescale only applies to --method avg / proj (got {args.method})")
+    if args.method == "enforce":
+        if args.trigger_acc is not None or args.trigger_epoch not in (None, 0):
+            raise SystemExit("--method enforce symmetrises at init; drop --trigger_acc / --trigger_epoch")
+        args.trigger_epoch = 0
     if args.trigger_epoch is not None and args.trigger_epoch < 0:
         raise SystemExit("--trigger_epoch must be >= 0")
 
-    # gcnn ignores --epochs (it is driven by --stage1_epochs/--stage2_epochs).
+    if args.dataset == "NCT_CRC_HE":
+        if args.image_size is None:
+            args.image_size = DEFAULT_IMAGE_SIZE
+    elif args.image_size is not None:
+        raise SystemExit("--image_size is only supported for --dataset NCT_CRC_HE")
+    args.num_classes = get_num_classes(args.dataset)
+
     if args.method == "gcnn":
         args.epochs = args.stage1_epochs + args.stage2_epochs
         print(
@@ -492,26 +701,51 @@ def main():
         batch_size=args.batch_size,
         train_size=args.train_size,
         augmentation_mode=args.augmentation,
+        image_size=args.image_size,
     )
-    in_channels = next(iter(train_loader))[0].shape[1]
+    sample_inputs = next(iter(train_loader))[0]
+    in_channels = sample_inputs.shape[1]
 
     if args.conv_channels is None:
-        args.conv_channels = [64, 128, 256] if args.dataset == "CIFAR10" else [32, 64]
+        if args.dataset == "NCT_CRC_HE":
+            # five conv + 2x2-pool blocks: 224 -> 7
+            args.conv_channels = [32, 64, 128, 256, 256]
+        else:
+            args.conv_channels = [64, 128, 256] if args.dataset == "CIFAR10" else [32, 64]
+    group = {"gcnn": args.group_size, "p4cnn": P4_GROUP_SIZE}.get(args.method)
+    if group is not None and any(c % group != 0 for c in args.conv_channels):
+        raise SystemExit(
+            f"--method {args.method}: every --conv_channels entry must be divisible by {group} "
+            f"(got {args.conv_channels})"
+        )
+    side = sample_inputs.shape[-1]
+    if side % (2 ** len(args.conv_channels)) != 0:
+        print(
+            f"Warning: input size {side} is not divisible by 2**{len(args.conv_channels)}; max-pooling an "
+            "odd-sized feature map breaks exact C4 equivariance."
+        )
 
+    method_tag = {"enforce": f"enforce-{args.enforce_op}", "orbit": f"orbit-{args.orbit_lik}"}.get(
+        args.method, args.method
+    )
     if not args.no_wandb:
         if args.run_name is None:
-            args.run_name = f"{args.method}_{args.optimizer}_{args.dataset}_{args.augmentation}_{args.seed}"
+            args.run_name = f"{method_tag}_{args.optimizer}_{args.dataset}_{args.augmentation}_{args.seed}"
         wandb.init(project=args.project, name=args.run_name, config=vars(args))
 
     loaders = (train_loader, test_loader, equiv_loader)
-    if args.method in ("avg", "proj", "baseline"):
+    if args.method in ("avg", "proj", "baseline", "enforce"):
         model = run_avg_or_proj(args, loaders, in_channels, device)
+    elif args.method == "p4cnn":
+        model = run_p4cnn(args, loaders, in_channels, device)
+    elif args.method == "orbit":
+        model = run_orbit(args, loaders, in_channels, device)
     else:
         model = run_gcnn(args, loaders, in_channels, device)
 
     if args.save_model:
         if args.save_path is None:
-            name = f"{args.method}_{args.optimizer}_{args.dataset}_{args.augmentation}_{args.seed}.pt"
+            name = f"{method_tag}_{args.optimizer}_{args.dataset}_{args.augmentation}_{args.seed}.pt"
             args.save_path = os.path.join("trained_models", name)
         save_dir = os.path.dirname(args.save_path)
         if save_dir:

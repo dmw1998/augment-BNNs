@@ -25,8 +25,9 @@ import wandb
 from torch.utils.data import DataLoader
 
 from ebnn.data import EquivarianceEvalSet, get_loaders
-from ebnn.metrics import compute_orbits_same_pred, compute_symmetric_kl_divergence
+from ebnn.metrics import compute_orbits_same_pred_mc, compute_symmetric_kl_divergence_mc
 from ebnn.models import BayesianCNNConfigurable
+from ebnn.symmetrize import build_optimizer, describe_optimizer
 
 
 def train_bayesian_cnn(
@@ -48,6 +49,10 @@ def train_bayesian_cnn(
     kl_annealing_epochs_fc=0,
     free_bits=0.0,
     weight_decay=1e-4,
+    optimizer_name="adamw",
+    momentum=0.9,
+    nesterov=False,
+    rho_lr_mult=10.0,
 ):
     """Train a Bayesian CNN on rotation-augmented data with equivariance evaluation.
 
@@ -62,7 +67,16 @@ def train_bayesian_cnn(
     current_kl_weight_conv = 0.0 if kl_annealing_epochs > 0 else target_kl_weight_conv
     current_kl_weight_fc = 0.0 if kl_annealing_epochs_fc > 0 else target_kl_weight_fc
 
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = build_optimizer(
+        model,
+        optimizer=optimizer_name,
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        momentum=momentum,
+        nesterov=nesterov,
+        rho_lr_mult=rho_lr_mult,
+    )
+    print("Optimizer:", describe_optimizer(optimizer))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.CrossEntropyLoss()
 
@@ -180,9 +194,9 @@ def train_bayesian_cnn(
             avg_val_loss = total_val_loss / len(test_loader.dataset)
             val_acc = 100.0 * correct_val / total_val
 
-            # Equivariance metrics on the held-out set.
-            kl_test = compute_symmetric_kl_divergence(model, device, equiv_loader)
-            osp_test = compute_orbits_same_pred(model, device, equiv_loader)
+            # Equivariance metrics on the held-out set (MC-averaged, matching train_symmetrization).
+            kl_test = compute_symmetric_kl_divergence_mc(model, equiv_loader, device, eval_samples)
+            osp_test = compute_orbits_same_pred_mc(model, equiv_loader, device, eval_samples)
 
             # Equivariance metrics on a C4-orbit set built from the training data.
             train_base = getattr(train_loader.dataset, "base_dataset", train_loader.dataset)
@@ -194,19 +208,19 @@ def train_bayesian_cnn(
                 num_workers=4,
                 pin_memory=False,
             )
-            kl_train = compute_symmetric_kl_divergence(model, device, train_equiv_loader)
-            osp_train = compute_orbits_same_pred(model, device, train_equiv_loader)
+            kl_train = compute_symmetric_kl_divergence_mc(model, train_equiv_loader, device, eval_samples)
+            osp_train = compute_orbits_same_pred_mc(model, train_equiv_loader, device, eval_samples)
 
             val_metrics = {
                 "epoch": epoch + 1,
                 "val/loss": avg_val_loss,
                 "val/accuracy": val_acc,
-                "equivariance_test/orbits_same_pred": osp_test,
-                "equivariance_test/symmetric_kl_div_mean": kl_test["mean"],
-                "equivariance_test/symmetric_kl_div_std": kl_test["std"],
-                "equivariance_train/orbits_same_pred": osp_train,
-                "equivariance_train/symmetric_kl_div_mean": kl_train["mean"],
-                "equivariance_train/symmetric_kl_div_std": kl_train["std"],
+                "val/orbits_same_pred": osp_test,
+                "val/symmetric_kl_div_mean": kl_test["mean"],
+                "val/symmetric_kl_div_std": kl_test["std"],
+                "train/orbits_same_pred": osp_train,
+                "train/symmetric_kl_div_mean": kl_train["mean"],
+                "train/symmetric_kl_div_std": kl_train["std"],
             }
             if use_wandb:
                 wandb.log(val_metrics)
@@ -260,6 +274,16 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "sgd"],
+        help="To match the SGD main results use: --optimizer sgd --lr 1e-2 --weight_decay 0 --nesterov",
+    )
+    parser.add_argument("--momentum", type=float, default=0.9, help="SGD only.")
+    parser.add_argument("--nesterov", action=argparse.BooleanOptionalAction, default=False, help="SGD only.")
+    parser.add_argument("--rho_lr_mult", type=float, default=10.0, help="SGD: rho group LR = lr * this.")
     parser.add_argument(
         "--kl_weight", type=float, default=None, help="KL weight for conv layers (1/N if None)"
     )
@@ -365,6 +389,10 @@ def main():
         kl_annealing_epochs_fc=args.kl_annealing_epochs_fc,
         free_bits=args.free_bits,
         weight_decay=args.weight_decay,
+        optimizer_name=args.optimizer,
+        momentum=args.momentum,
+        nesterov=args.nesterov,
+        rho_lr_mult=args.rho_lr_mult,
     )
 
     if use_wandb:
